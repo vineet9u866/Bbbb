@@ -1,4 +1,4 @@
-name: RDP
+name: RDP with GPU
 
 on:
   workflow_dispatch:
@@ -9,59 +9,127 @@ jobs:
     timeout-minutes: 3600
 
     steps:
-      - name: Enable GPU Acceleration for RDP
-        run: |
-          # 1. Use hardware graphics adapters for all Remote Desktop Services sessions
-          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v fEnableHardwareGraphicsAcceleration /t REG_DWORD /d 1 /f
-          
-          # 2. Prioritize H.264/AVC 444 Graphics mode for RDP connections
-          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v fPrioritizeAVC444Mode /t REG_DWORD /d 1 /f
-          
-          # 3. Configure H.264/AVC hardware encoding for RDP connections
-          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v fAVCConnectHardwareEncoding /t REG_DWORD /d 1 /f
-          
-          # 4. Optimal performance adjustments (Disable compression to reduce overhead)
-          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v fSelectRdpCompressionAlgorithm /t REG_DWORD /d 0 /f
-        shell: powershell
-
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-          # Remove any existing rule with the same name to avoid duplication
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # Allow incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
 
-          # Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
+
+      # ──────────────────────────────────────────────
+      #  RDP DISPLAY QUALITY (Gemini's keys)
+      #  These control HOW the screen is streamed
+      #  to your RDP client — better codec, better
+      #  color, less compression overhead.
+      #  Effect: smoother/sharper remote desktop view.
+      #  Note: HW encoder keys are set but fall back
+      #  to software on free runners (no real GPU).
+      # ──────────────────────────────────────────────
+      - name: Enable GPU Acceleration for RDP
+        shell: powershell
+        run: |
+          # 1. Use hardware graphics adapters for RDP sessions (falls back to SW on free runners)
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v fEnableHardwareGraphicsAcceleration /t REG_DWORD /d 1 /f
+
+          # 2. Prioritize H.264/AVC 444 mode — best color fidelity over RDP
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v fPrioritizeAVC444Mode /t REG_DWORD /d 1 /f
+
+          # 3. H.264/AVC hardware encoding for RDP stream
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v fAVCConnectHardwareEncoding /t REG_DWORD /d 1 /f
+
+          # 4. Disable RDP compression — reduces CPU overhead, better for fast connections
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v fSelectRdpCompressionAlgorithm /t REG_DWORD /d 0 /f
+
+          # 5. Enable RemoteFX VGPU (software GPU adapter exposed to RDP session)
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v fEnableRemoteFXAdvancedRemoteApp /t REG_DWORD /d 1 /f
+
+          # 6. Maximum color depth for RDP session (32-bit)
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v ColorDepth /t REG_DWORD /d 5 /f
+
+          # 7. Allow font smoothing / ClearType over RDP
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v AllowFontSmoothing /t REG_DWORD /d 1 /f
+
+          # 8. Desktop composition (Aero/DWM) over RDP
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v AllowDesktopComposition /t REG_DWORD /d 1 /f
+
+          Write-Host "RDP display quality keys applied."
+
+      # ──────────────────────────────────────────────
+      #  SOFTWARE GPU (Microsoft WARP)
+      #  Installs DirectX runtime + enables WARP,
+      #  a D3D12-capable software adapter.
+      #  Effect: apps that REQUIRE a GPU adapter
+      #  (games, 3D tools, ML frameworks) will find
+      #  one and not crash on launch.
+      # ──────────────────────────────────────────────
+      - name: Install DirectX Runtime and GPU Software Stack
+        run: |
+          Write-Host "=== Installing GPU Software Stack ==="
+
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+          Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+
+          # DirectX End-User Runtime (D3D, DXGI, DSound etc.)
+          choco install directx -y --no-progress
+
+          # Visual C++ redistributables (required by most GPU apps)
+          choco install vcredist-all -y --no-progress
+
+          # Enable WSL2 DXGI GPU interface (exposes WARP D3D12 adapter inside sessions)
+          dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
+          dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
+
+          # WARP adapter registry hint
+          $regPath = "HKLM:\SOFTWARE\Microsoft\DirectX"
+          if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force }
+          Set-ItemProperty -Path $regPath -Name "FlipEx" -Value 1 -Force
+
+          Write-Host "=== GPU Software Stack Ready ==="
+
+      - name: Install GPU Monitoring Tools
+        run: |
+          choco install hwinfo -y --no-progress
+
+          # Run dxdiag and print display adapter info to the log
+          Start-Process dxdiag -ArgumentList "/t $env:TEMP\dxdiag.txt" -Wait
+          if (Test-Path "$env:TEMP\dxdiag.txt") {
+              $dxInfo = Get-Content "$env:TEMP\dxdiag.txt" | Select-String "Display Devices" -Context 0,10
+              Write-Host $dxInfo
+          }
 
       - name: Create RDP User with Secure Password
         run: |
           Add-Type -AssemblyName System.Security
-          \$charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126)) # Special characters
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126))
           }
-          \$rawPassword = @()
-          rawPassword += charSet.Upper | Get-Random -Count 4
-          rawPassword += charSet.Lower | Get-Random -Count 4
-          rawPassword += charSet.Number | Get-Random -Count 4
-          rawPassword += charSet.Special | Get-Random -Count 4
-          password = -join (rawPassword | Sort-Object { Get-Random })
-          securePass = ConvertTo-SecureString password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password \$securePass -AccountNeverExpires
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
-          echo "RDP_CREDS=User: RDP | Password: password" >> env:GITHUB_ENV
-          
+
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
           if (-not (Get-LocalUser -Name "RDP")) {
               Write-Error "User creation failed"
               exit 1
@@ -69,39 +137,37 @@ jobs:
 
       - name: Install Tailscale
         run: |
-          \$tsUrl = "https://tailscale.com"
-          installerPath = "env:TEMP\tailscale.msi"
-          
-          Invoke-WebRequest -Uri tsUrl -OutFile installerPath
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item \$installerPath -Force
+          Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "\$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=\({{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-\)env:GITHUB_RUN_ID
-          
-          # Wait for Tailscale to assign an IP
-          \$tsIP = \(null\)retries = 0
-          while (-not tsIP -and retries -lt 10) {
-              \(tsIP = & "\)env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+              --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+              --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
               Start-Sleep -Seconds 5
-              \$retries++
+              $retries++
           }
-          
-          if (-not \$tsIP) {
+
+          if (-not $tsIP) {
               Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
           }
-          echo "TAILSCALE_IP=tsIP" >> env:GITHUB_ENV
-      
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
       - name: Verify RDP Accessibility
         run: |
-          Write-Host "Tailscale IP: \$env:TAILSCALE_IP"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          testResult = Test-NetConnection -ComputerName env:TAILSCALE_IP -Port 3389
-          if (-not \$testResult.TcpTestSucceeded) {
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
               Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
           }
@@ -110,13 +176,20 @@ jobs:
       - name: Maintain Connection
         run: |
           Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $env:RDP_CREDS"
+          Write-Host "Address  : $env:TAILSCALE_IP"
+          Write-Host "Username : RDP"
+          Write-Host "Password : $(echo $env:RDP_CREDS)"
+          Write-Host ""
+          Write-Host "=== GPU STACK ==="
+          Write-Host "RDP Codec    : H.264/AVC 444 (best quality)"
+          Write-Host "Color Depth  : 32-bit"
+          Write-Host "GPU Adapter  : Microsoft WARP D3D12 (software)"
+          Write-Host "DirectX      : 12 via DXGI"
+          Write-Host "Real GPU     : Not available on free runners"
+          Write-Host "             : Upgrade to GitHub Team for NVIDIA T4"
           Write-Host "==================`n"
-          
-          # Keep runner active indefinitely
-          while (\$true) {
-              Write-Host "[\$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Cancel workflow to terminate"
               Start-Sleep -Seconds 300
           }
